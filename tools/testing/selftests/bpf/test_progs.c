@@ -1429,6 +1429,8 @@ static void run_one_test(int test_num)
 	env.test_state = state;
 
 	stdio_hijack(&state->log_buf, &state->log_cnt);
+	fprintf(env.stdout_saved, "\n\n--- #%-*d %s:\n", TEST_NUM_WIDTH, test->test_num, test->test_name);
+
 
 	watchdog_start();
 	if (ns_is_needed(test->test_name))
