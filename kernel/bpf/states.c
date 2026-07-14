@@ -386,9 +386,9 @@ static bool check_scalar_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap)
 
 	if (!check_ids(old_id, cur_id, idmap))
 		return false;
-	if (old_id & BPF_ADD_CONST) {
-		old_id &= ~BPF_ADD_CONST;
-		cur_id &= ~BPF_ADD_CONST;
+	if (old_id & (BPF_ADD_CONST | BPF_SUBREG_EQ)) {
+		old_id &= ~(BPF_ADD_CONST | BPF_SUBREG_EQ);
+		cur_id &= ~(BPF_ADD_CONST | BPF_SUBREG_EQ);
 		if (!check_ids(old_id, cur_id, idmap))
 			return false;
 	}
@@ -541,6 +541,24 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 
 	switch (base_type(rold->type)) {
 	case SCALAR_VALUE:
+		/*
+		 * Sign-extension tracking changes how a register is
+		 * narrowed and reconstructed later:
+		 *  - BPF_SUBREG_EQ marks a low-32-bit-only link (vs full/ADD_CONST
+		 *    equality) with different sync_linked_regs() semantics;
+		 *  - sext_width marks that the high bits are the sign-extension of
+		 *    the low field, driving reconstruction on a later narrowing.
+		 * Neither is captured by the range/tnum comparison or the id map,
+		 * so a mismatch is not safe to prune across. (Conservative: exact
+		 * match. sext_width lives past ->id, so it is also excluded from
+		 * the explore_alu_limits memcmp below; check both here first.)
+		 */
+		if (rold->id &&
+		    (rold->id & BPF_SUBREG_EQ) != (rcur->id & BPF_SUBREG_EQ))
+			return false;
+		if (rold->sext_width != rcur->sext_width)
+			return false;
+
 		if (env->explore_alu_limits) {
 			/* explore_alu_limits disables tnum_in() and range_within()
 			 * logic and requires everything to be strict
