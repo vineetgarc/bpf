@@ -743,4 +743,53 @@ l0_%=:								\
 	: __clobber_all);
 }
 
+/*
+ * Rep B regression test: a program that mixes sign-extension linked registers
+ * (BPF_SUBREG_EQ + sext_width) with state-frequency checkpointing across two
+ * paths that link r3 to different bases must stay rejected. On the false branch
+ * r3 = (s32)r2 (base r2); on the true branch r3 = (s32)r4 (base r4). After
+ * `if w2 != 0` (fall-through w2 == 0) only the r2-linked r3 rebuilds to 0, so
+ * the guarded div-by-zero is reachable on the true path and must be caught.
+ *
+ * NOTE: this is a coverage/regression test, not a proven soundness witness --
+ * it stays rejected with or without the regsafe()/check_scalar_ids() Phase 5
+ * checks (existing compound-id and range checks already prevent the merge). A
+ * test that specifically flips on the state-pruning checks is still TODO.
+ */
+SEC("socket")
+__failure __msg("div by zero")
+__flag(BPF_F_TEST_STATE_FREQ)
+__naked void sext_linked_pruning_regression(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r6 = r0;						\
+	r6 &= 1;						\
+	if r6 >= 1 goto l_true_%=;				\
+	/* False branch (explored first, old state) */		\
+	call %[bpf_get_prandom_u32];				\
+	r2 = r0;		/* r2 = base, id A */		\
+	r3 = (s32)r2;		/* r3 = sext32(r2): SUBREG_EQ base A */	\
+	goto l_merge_%=;					\
+l_true_%=:							\
+	/* True branch (cur state) */				\
+	call %[bpf_get_prandom_u32];				\
+	r2 = r0;		/* r2 unrelated base */		\
+	call %[bpf_get_prandom_u32];				\
+	r4 = r0;		/* r4 = base, id C */		\
+	r3 = (s32)r4;		/* r3 = sext32(r4): SUBREG_EQ base C */	\
+l_merge_%=:							\
+	/* r3 has the same range on both paths; only its base id differs. */ \
+	if w2 != 0 goto l_exit_%=;				\
+	/* old: r3 synced from r2 -> 0; cur: r3 linked to r4, unchanged. */ \
+	if r3 == 0 goto l_exit_%=;				\
+	r0 /= 0;		/* reachable on cur only */	\
+l_exit_%=:							\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";
