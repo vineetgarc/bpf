@@ -146,6 +146,15 @@ struct bpf_reg_state {
 #define BPF_ADD_CONST64 (1U << 31)
 #define BPF_ADD_CONST32 (1U << 30)
 #define BPF_ADD_CONST (BPF_ADD_CONST64 | BPF_ADD_CONST32)
+	/*
+	 * Sign-extension linked-register tracking. A register with
+	 * BPF_SUBREG_EQ set in its id shares only its LOW 32 bits with the
+	 * linked base (id & ~flags); sync_linked_regs() must propagate only the
+	 * 32-bit subrange for it (not the full 64-bit state). Paired with
+	 * ->sext_width below, which records that the high bits are the
+	 * sign-extension of this register's own low field.
+	 */
+#define BPF_SUBREG_EQ (1U << 29)
 	u32 id;
 	/*
 	 * Tracks the parent object this register was derived from.
@@ -169,6 +178,15 @@ struct bpf_reg_state {
 	s32 subreg_def;
 	/* if (!precise && SCALAR_VALUE) min/max/tnum don't affect safety */
 	bool precise;
+	/*
+	 * Sign-extension self-property: if non-zero (1/2/4), this
+	 * register's high bits are the sign-extension of its own low
+	 * sext_width-byte field. reg_bounds_sync() reconstructs the high half
+	 * from the low field when the latter is narrowed. 0 means no such
+	 * relationship. Placed here to reuse existing tail padding (no struct
+	 * size growth). See BPF_SUBREG_EQ above.
+	 */
+	u8 sext_width;
 };
 
 static inline s64 reg_smin(const struct bpf_reg_state *reg)

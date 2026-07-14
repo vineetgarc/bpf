@@ -710,4 +710,37 @@ l_exit_%=:							\
 	: __clobber_all);
 }
 
+/*
+ * Sign-extension state tracking red test.
+ *
+ * r1 = r0 ties r0,r1 with a shared id. r0 = (s32)r0 sign-extends r0's low 32
+ * bits; the sign bit isn't provably 0 (umax = 0xffffffff) so today the verifier
+ * calls clear_scalar_id(r0), dropping the link. On the w1 == 0 fall-through,
+ * r1's low 32 bits are 0; r0's low 32 bits equal r1's, and r0's upper bits are
+ * the sign-extension of that (0) — so r0 == 0.
+ *
+ * The guarded div-by-zero is unreachable iff the verifier deduces r0 == 0.
+ * TODO: currently FAILS ("div by zero"); flips to __success once the
+ * subreg-equality link + sext-self recompute land.
+ */
+SEC("socket")
+__success
+__naked void sext_linked_low_narrow_to_zero(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r1 = r0;		/* r1 == r0, shared id */	\
+	r0 = (s32)r0;		/* r0 = sext32(r0) */		\
+	if w1 != 0 goto l0_%=;	/* fall-through: w1 == 0 */	\
+	/* want deduced here: r0 == 0 */			\
+	if r0 == 0 goto l0_%=;	/* always taken iff r0==0 known */ \
+	r0 /= 0;		/* unreachable iff r0==0 deduced */ \
+l0_%=:								\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";

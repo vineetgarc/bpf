@@ -1823,6 +1823,8 @@ static void __mark_reg_known(struct bpf_reg_state *reg, u64 imm)
 	       offsetof(struct bpf_reg_state, var_off) - sizeof(reg->type));
 	reg->id = 0;
 	reg->parent_id = 0;
+	/* A known constant has no sign-extension self-relationship. */
+	reg->sext_width = 0;
 	___mark_reg_known(reg, imm);
 }
 
@@ -3358,6 +3360,8 @@ static void clear_scalar_id(struct bpf_reg_state *reg)
 {
 	reg->id = 0;
 	reg->delta = 0;
+	/* id = 0 also clears BPF_SUBREG_EQ; drop any sext-self relationship. */
+	reg->sext_width = 0;
 }
 
 static void assign_scalar_id_before_mov(struct bpf_verifier_env *env,
@@ -14985,15 +14989,30 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 							insn->src_reg);
 						return -EACCES;
 					} else if (src_reg->type == SCALAR_VALUE) {
+						int sz = insn->off >> 3;
 						bool no_sext;
 
 						no_sext = reg_umax(src_reg) < (1ULL << (insn->off - 1));
-						if (no_sext)
+						/*
+						 * When no_sext, dst == src exactly, so link them (existing
+						 * behavior). When !no_sext for a 32-bit sign extension, the
+						 * low 32 bits are still identical (sext preserves them), so
+						 * keep a BPF_SUBREG_EQ link plus a sext-self marker:
+						 * a later narrowing of the low 32 bits propagates here, and
+						 * reg_bounds_sync()/sync_linked_regs() rebuild the high half.
+						 */
+						if (no_sext || sz == 4)
 							assign_scalar_id_before_mov(env, src_reg);
 						*dst_reg = *src_reg;
-						if (!no_sext)
-							clear_scalar_id(dst_reg);
-						coerce_reg_to_size_sx(dst_reg, insn->off >> 3);
+						if (!no_sext) {
+							if (sz == 4 && (src_reg->id & ~BPF_SUBREG_EQ)) {
+								dst_reg->id = src_reg->id | BPF_SUBREG_EQ;
+								dst_reg->sext_width = 4;
+							} else {
+								clear_scalar_id(dst_reg);
+							}
+						}
+						coerce_reg_to_size_sx(dst_reg, sz);
 						dst_reg->subreg_def = DEF_NOT_SUBREG;
 					} else {
 						mark_reg_unknown(env, regs, insn->dst_reg);
@@ -15824,7 +15843,8 @@ static void __collect_linked_regs(struct linked_regs *reg_set, struct bpf_reg_st
 {
 	struct linked_reg *e;
 
-	if (reg->type != SCALAR_VALUE || (reg->id & ~BPF_ADD_CONST) != id)
+	if (reg->type != SCALAR_VALUE ||
+	    (reg->id & ~(BPF_ADD_CONST | BPF_SUBREG_EQ)) != id)
 		return;
 
 	e = linked_regs_push(reg_set);
@@ -15852,7 +15872,7 @@ static void collect_linked_regs(struct bpf_verifier_env *env,
 	u16 live_regs;
 	int i, j;
 
-	id = id & ~BPF_ADD_CONST;
+	id = id & ~(BPF_ADD_CONST | BPF_SUBREG_EQ);
 	for (i = vstate->curframe; i >= 0; i--) {
 		live_regs = aux[bpf_frame_insn_idx(vstate, i)].live_regs_before;
 		func = vstate->frame[i];
@@ -15868,6 +15888,30 @@ static void collect_linked_regs(struct bpf_verifier_env *env,
 			reg = &func->stack[j].spilled_ptr;
 			__collect_linked_regs(linked_regs, reg, id, i, j, false);
 		}
+	}
+}
+
+/*
+ * Set @reg to the sign-extension of the low 32 bits currently held by
+ * @src (a BPF_SUBREG_EQ-linked register shares only @src's low 32 bits, and its
+ * high bits are the sign-extension of that low field). Only the value fields are
+ * written; @reg's linkage fields (id, delta, subreg_def, sext_width) are left
+ * intact by the caller (___mark_reg_known touches only var_off/r64/r32).
+ */
+static void reconstruct_sext32(struct bpf_reg_state *reg, struct bpf_reg_state *src)
+{
+	s32 s32min = reg_s32_min(src);
+	s32 s32max = reg_s32_max(src);
+
+	if (s32min == s32max) {
+		/* Low 32 bits are constant -> the whole value is the sext constant. */
+		___mark_reg_known(reg, (u64)(s64)s32min);
+	} else {
+		/* Sign-extension is monotonic over the signed-32 range. */
+		reg_set_srange64(reg, (s64)s32min, (s64)s32max);
+		reg_set_srange32(reg, s32min, s32max);
+		reg->var_off = tnum_range((u64)(s64)s32min, (u64)(s64)s32max);
+		reg_bounds_sync(reg);
 	}
 }
 
@@ -15888,7 +15932,32 @@ static void sync_linked_regs(struct bpf_verifier_env *env, struct bpf_verifier_s
 				: &vstate->frame[e->frameno]->stack[e->spi].spilled_ptr;
 		if (reg->type != SCALAR_VALUE || reg == known_reg)
 			continue;
-		if ((reg->id & ~BPF_ADD_CONST) != (known_reg->id & ~BPF_ADD_CONST))
+		if ((reg->id & ~(BPF_ADD_CONST | BPF_SUBREG_EQ)) !=
+		    (known_reg->id & ~(BPF_ADD_CONST | BPF_SUBREG_EQ)))
+			continue;
+		/*
+		 * A BPF_SUBREG_EQ linked register shares only the base's
+		 * low 32 bits; its high bits are the sign-extension of that low
+		 * field. Rebuild it from known_reg's low 32 bits instead of
+		 * copying the full 64-bit state.
+		 */
+		if (reg->id & BPF_SUBREG_EQ) {
+			s32 saved_subreg_def = reg->subreg_def;
+
+			reconstruct_sext32(reg, known_reg);
+			reg->subreg_def = saved_subreg_def;
+			if (e->is_reg)
+				mark_reg_scratched(env, e->regno);
+			else
+				mark_stack_slot_scratched(env, e->spi);
+			continue;
+		}
+		/*
+		 * Dest-driven direction (known_reg is sext-derived) is not handled
+		 * yet: copying its high bits into a plain linked register would be
+		 * unsound, so leave the other register unchanged.
+		 */
+		if (known_reg->id & BPF_SUBREG_EQ)
 			continue;
 		/*
 		 * Skip mixed 32/64-bit links: the delta relationship doesn't
