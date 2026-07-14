@@ -750,12 +750,15 @@ l0_%=:								\
  *
  * This is the general (non-in-place) counterpart of sext_linked_low_narrow_to_zero.
  *
- * NOTE: passes without BPF_F_TEST_STATE_FREQ; adding that flag currently makes it
- * FAIL ("div by zero") because the sext linkage (BPF_SUBREG_EQ + sext_width) does
- * not survive state checkpointing/cleaning -> pending Phase 6 (precision).
+ * Runs with BPF_F_TEST_STATE_FREQ to force checkpointing between the sext and the
+ * branch: the sext linkage (BPF_SUBREG_EQ + sext_width) must survive state
+ * cleaning so sync_linked_regs() can still reconstruct r3. This requires
+ * bpf_clear_singular_ids() to strip BPF_SUBREG_EQ when counting base ids;
+ * otherwise r3's compound id looks singular and gets cleared, and r3 stays wide.
  */
 SEC("socket")
 __success
+__flag(BPF_F_TEST_STATE_FREQ)
 __naked void sext_linked_separate_dest_narrow_to_zero(void)
 {
 	asm volatile ("						\

@@ -17023,7 +17023,7 @@ void bpf_clear_singular_ids(struct bpf_verifier_env *env,
 			continue;
 		if (!reg->id)
 			continue;
-		idset_cnt_inc(idset, reg->id & ~BPF_ADD_CONST);
+		idset_cnt_inc(idset, reg->id & ~(BPF_ADD_CONST | BPF_SUBREG_EQ));
 	}));
 
 	bpf_for_each_reg_in_vstate(st, func, reg, ({
@@ -17031,7 +17031,7 @@ void bpf_clear_singular_ids(struct bpf_verifier_env *env,
 			continue;
 		if (!reg->id)
 			continue;
-		if (idset_cnt_get(idset, reg->id & ~BPF_ADD_CONST) == 1)
+		if (idset_cnt_get(idset, reg->id & ~(BPF_ADD_CONST | BPF_SUBREG_EQ)) == 1)
 			clear_scalar_id(reg);
 	}));
 }
