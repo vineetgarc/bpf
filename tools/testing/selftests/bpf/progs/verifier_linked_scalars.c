@@ -777,4 +777,98 @@ l0_%=:								\
 	: __clobber_all);
 }
 
+/*
+ * Coverage (derived from real "R0 ... should have been in [0, 1]" exit
+ * rejections). Each sign-extends a value, then a branch proves its low 32 bits
+ * are 0 so the sext result must be 0. Expressed with the div-by-zero idiom (same
+ * deduced range the return-code check reads): the div is unreachable iff the
+ * verifier deduces the sext register is 0.
+ */
+
+/* 1: branch on the SOURCE reg; separate dest (value stands in for a u32 load). */
+SEC("socket")
+__success
+__naked void sext_narrow_branch_on_source(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r2 = r0;		/* r2 = value (proxy for u32 load) */	\
+	r0 = (s32)r2;		/* r0 = sext32(r2) */		\
+	if w2 != 0 goto l0_%=;	/* w2 != 0: r0 unknown, skip */	\
+	if r0 == 0 goto l0_%=;	/* w2 == 0: r0 must be 0 */	\
+	r0 /= 0;						\
+l0_%=:								\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+/* 2: sext into r7, prove via w0, then copy r7 back into r0. */
+SEC("socket")
+__success
+__naked void sext_narrow_copied_back(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r7 = (s32)r0;		/* r7 = sext32(r0) */		\
+	if w0 != 0 goto l0_%=;	/* w0 != 0: skip */		\
+	r0 = r7;		/* w0 == 0: r0 = r7 (must be 0) */ \
+	if r0 == 0 goto l0_%=;					\
+	r0 /= 0;						\
+l0_%=:								\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all, "r7");
+}
+
+/* 3: in-place sext; branch on the pre-sext copy r1 (== direction). */
+SEC("socket")
+__success
+__naked void sext_narrow_inplace_pre_copy(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r1 = r0;		/* pre-sext copy, linked */	\
+	r0 = (s32)r0;		/* in-place sext32 */		\
+	if w1 == 0 goto l_chk_%=;/* w1 == 0: r0 must be 0 */	\
+	r0 = 0;			/* w1 != 0: make return valid */\
+	goto l0_%=;						\
+l_chk_%=:							\
+	if r0 == 0 goto l0_%=;					\
+	r0 /= 0;						\
+l0_%=:								\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+/* 4: sext, prove via w0, spill to stack across a call, reload, use. */
+SEC("socket")
+__success
+__naked void sext_narrow_spill_fill(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r9 = (s32)r0;		/* r9 = sext32(r0) */		\
+	if w0 != 0 goto l0_%=;	/* w0 != 0: skip */		\
+	/* w0 == 0: r9 must be 0 */				\
+	*(u64 *)(r10 - 8) = r9;	/* spill r9 */			\
+	call %[bpf_get_prandom_u32];/* clobbers r0-r5 */	\
+	r5 = *(u64 *)(r10 - 8);	/* reload -> must be 0 */	\
+	if r5 == 0 goto l0_%=;					\
+	r0 /= 0;						\
+l0_%=:								\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all, "r9");
+}
+
 char _license[] SEC("license") = "GPL";
