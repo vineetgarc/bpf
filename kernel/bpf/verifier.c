@@ -15843,8 +15843,7 @@ static void __collect_linked_regs(struct linked_regs *reg_set, struct bpf_reg_st
 {
 	struct linked_reg *e;
 
-	if (reg->type != SCALAR_VALUE ||
-	    (reg->id & ~(BPF_ADD_CONST | BPF_SUBREG_EQ)) != id)
+	if (reg->type != SCALAR_VALUE || reg_id_scalar_id(reg->id) != id)
 		return;
 
 	e = linked_regs_push(reg_set);
@@ -15872,7 +15871,7 @@ static void collect_linked_regs(struct bpf_verifier_env *env,
 	u16 live_regs;
 	int i, j;
 
-	id = id & ~(BPF_ADD_CONST | BPF_SUBREG_EQ);
+	id = reg_id_scalar_id(id);
 	for (i = vstate->curframe; i >= 0; i--) {
 		live_regs = aux[bpf_frame_insn_idx(vstate, i)].live_regs_before;
 		func = vstate->frame[i];
@@ -15932,8 +15931,7 @@ static void sync_linked_regs(struct bpf_verifier_env *env, struct bpf_verifier_s
 				: &vstate->frame[e->frameno]->stack[e->spi].spilled_ptr;
 		if (reg->type != SCALAR_VALUE || reg == known_reg)
 			continue;
-		if ((reg->id & ~(BPF_ADD_CONST | BPF_SUBREG_EQ)) !=
-		    (known_reg->id & ~(BPF_ADD_CONST | BPF_SUBREG_EQ)))
+		if (reg_id_scalar_id(reg->id) != reg_id_scalar_id(known_reg->id))
 			continue;
 		/*
 		 * A BPF_SUBREG_EQ linked register shares only the base's
@@ -17023,7 +17021,7 @@ void bpf_clear_singular_ids(struct bpf_verifier_env *env,
 			continue;
 		if (!reg->id)
 			continue;
-		idset_cnt_inc(idset, reg->id & ~(BPF_ADD_CONST | BPF_SUBREG_EQ));
+		idset_cnt_inc(idset, reg_id_scalar_id(reg->id));
 	}));
 
 	bpf_for_each_reg_in_vstate(st, func, reg, ({
@@ -17031,7 +17029,7 @@ void bpf_clear_singular_ids(struct bpf_verifier_env *env,
 			continue;
 		if (!reg->id)
 			continue;
-		if (idset_cnt_get(idset, reg->id & ~(BPF_ADD_CONST | BPF_SUBREG_EQ)) == 1)
+		if (idset_cnt_get(idset, reg_id_scalar_id(reg->id)) == 1)
 			clear_scalar_id(reg);
 	}));
 }
