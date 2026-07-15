@@ -14991,8 +14991,18 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 					} else if (src_reg->type == SCALAR_VALUE) {
 						int sz = insn->off >> 3;
 						bool no_sext;
+						bool in_loop;
+						bool subreg_link;
 
 						no_sext = reg_umax(src_reg) < (1ULL << (insn->off - 1));
+						/*
+						 * scc != 0 means this insn is in a non-singleton
+						 * strongly-connected component, i.e. a loop body.
+						 */
+						in_loop = env->insn_aux_data[env->insn_idx].scc != 0;
+
+						subreg_link = (sz == 4) && !in_loop;
+
 						/*
 						 * When no_sext, dst == src exactly, so link them (existing
 						 * behavior). When !no_sext for a 32-bit sign extension, the
@@ -15000,12 +15010,20 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 						 * keep a BPF_SUBREG_EQ link plus a sext-self marker:
 						 * a later narrowing of the low 32 bits propagates here, and
 						 * reg_bounds_sync()/sync_linked_regs() rebuild the high half.
+						 *
+						 * Skip the link inside a loop: forming it there mints
+						 * a fresh scalar id every iteration, and the live link
+						 * doubles the loop's branch-state space, preventing state
+						 * pruning from converging (bpf-gcc sign-extends inside
+						 * loops; LLVM does not). Only in-loop sext precision is
+						 * lost -- soundness is unaffected.
 						 */
-						if (no_sext || sz == 4)
+						if (no_sext || subreg_link)
 							assign_scalar_id_before_mov(env, src_reg);
 						*dst_reg = *src_reg;
 						if (!no_sext) {
-							if (sz == 4 && (src_reg->id & ~BPF_SUBREG_EQ)) {
+							if (subreg_link &&
+							    (src_reg->id & ~BPF_SUBREG_EQ)) {
 								dst_reg->id = src_reg->id | BPF_SUBREG_EQ;
 								dst_reg->sext_width = 4;
 							} else {
