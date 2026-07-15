@@ -871,4 +871,44 @@ l0_%=:								\
 	: __clobber_all, "r9");
 }
 
+/*
+ * A 32-bit sign-extension INSIDE a loop must verify and converge. This is the
+ * bytecode pattern bpf-gcc emits for a cond_break loop (see cond_break4): a
+ * counter is incremented with an ALU32 add (which zero-extends the high half)
+ * and then sign-extended in place every iteration.
+ *
+ * Sign-extension tracking links dst<->src on a sign-extension. Doing that for a sext in a loop
+ * body mints/refreshes the linked scalar id and its sext_width/BPF_SUBREG_EQ
+ * metadata each iteration; combined with the ALU32 add's BPF_ADD_CONST delta the
+ * loop-carried state never repeats, so state pruning can't converge and
+ * verification runs to the instruction limit. The loop-aware guard suppresses
+ * the link for a sext whose insn is in a loop (insn scc != 0), so the
+ * register reduces to a plain scalar and the loop converges.
+ *
+ * The pattern is written in asm so the bytecode is identical regardless of the
+ * host BPF compiler.
+ */
+SEC("socket")
+__success
+__naked void sext_in_loop_converges(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r2 = r0;		/* r2 = u32, high bits 0 */	\
+l_body_%=:							\
+	.byte 0xe5; /* may_goto l_exit (loop bound) */	\
+	.byte 0;						\
+	.short 3;						\
+	.long 0;						\
+	w2 += 1;		/* ALU32 add: low += 1, high = 0 */ \
+	r2 = (s32)r2;		/* in-place in-loop sign-extend */ \
+	goto l_body_%=;						\
+l_exit_%=:							\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";
