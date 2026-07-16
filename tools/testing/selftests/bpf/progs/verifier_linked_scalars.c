@@ -911,4 +911,38 @@ l_exit_%=:							\
 	: __clobber_all);
 }
 
+/*
+ * A redundant 32-bit sign-extension of an already-narrowed value must preserve
+ * the range. This is the errno-or-zero return pattern (set_if_not_errno_or_zero()
+ * followed by "return ret" on an int): the value is clamped to [-4095, 0] and
+ * then sign-extended again, e.g. verify_pkcs7_sig / many lsm.s progs under
+ * bpf-gcc. coerce_reg_to_size_sx() bails to the full [S32_MIN, S32_MAX] range
+ * when the range straddles the sign boundary (smin<0, smax>=0), so without the
+ * sext-self reconstruction the final "r0 = (s32)r0" widens [-4095, 0] back to
+ * the full range and the program is rejected. The verifier knows the high half is the
+ * sign-extension of the low 32 bits, so it rebuilds the tight range.
+ */
+SEC("socket")
+__success
+__naked void sext_resext_preserves_range(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r0 = (s32)r0;		/* r0 = [S32_MIN, S32_MAX] */	\
+	if r0 s> 0 goto l_out_%=;	/* r0 <= 0 */		\
+	if r0 s< -4095 goto l_out_%=;	/* r0 in [-4095, 0] */	\
+	r0 = (s32)r0;		/* redundant re-sext (pkcs7 pattern) */ \
+	if r0 s>= -4095 goto l_lo_ok_%=;/* must hold if range kept */ \
+	r0 /= 0;		/* reached only if lower bound lost */	\
+l_lo_ok_%=:							\
+	if r0 s<= 0 goto l_out_%=;	/* must hold if range kept */ \
+	r0 /= 0;		/* reached only if upper bound lost */	\
+l_out_%=:							\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";
