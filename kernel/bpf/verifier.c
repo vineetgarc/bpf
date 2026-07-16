@@ -14910,6 +14910,8 @@ clear_id:
 }
 
 /* check validity of 32-bit and 64-bit arithmetic operations */
+static void reconstruct_sext32(struct bpf_reg_state *reg, struct bpf_reg_state *src);
+
 static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
 	struct bpf_reg_state *regs = cur_regs(env);
@@ -15030,7 +15032,23 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 								clear_scalar_id(dst_reg);
 							}
 						}
-						coerce_reg_to_size_sx(dst_reg, sz);
+						/*
+						 * Snapshot the low 32 bits before coerce clobbers them.
+						 * coerce_reg_to_size_sx() falls back to the full sext
+						 * range when smin/smax straddle the sign boundary (e.g.
+						 * an errno-or-zero value clamped to [-4095, 0]). For a
+						 * sext-self tracked register the high half IS the
+						 * sign-extension of the low 32 bits, so rebuild the tight
+						 * 64-bit range from those low bounds.
+						 */
+						if (dst_reg->sext_width == 4) {
+							struct bpf_reg_state sext_src = *dst_reg;
+
+							coerce_reg_to_size_sx(dst_reg, sz);
+							reconstruct_sext32(dst_reg, &sext_src);
+						} else {
+							coerce_reg_to_size_sx(dst_reg, sz);
+						}
 						dst_reg->subreg_def = DEF_NOT_SUBREG;
 					} else {
 						mark_reg_unknown(env, regs, insn->dst_reg);
