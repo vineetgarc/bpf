@@ -785,7 +785,7 @@ static void list_version_get_info(struct target_type *tt, void *param)
 	struct vers_iter *info = param;
 
 	/* Check space - it might have changed since the first iteration */
-	if ((char *)info->vers + sizeof(tt->version) + strlen(tt->name) + 1 > info->end) {
+	if ((char *)info->vers + sizeof(struct dm_target_versions) + strlen(tt->name) + 1 > info->end) {
 		info->flags = DM_BUFFER_FULL_FLAG;
 		return;
 	}
@@ -1444,10 +1444,6 @@ static void retrieve_status(struct dm_table *table,
 
 		outptr += sizeof(struct dm_target_spec);
 		remaining = len - (outptr - outbuf);
-		if (remaining <= 0) {
-			param->flags |= DM_BUFFER_FULL_FLAG;
-			break;
-		}
 
 		/* Get the status/table string from the target driver */
 		if (ti->type->status) {
@@ -2273,12 +2269,9 @@ static long dm_compat_ctl_ioctl(struct file *file, uint command, ulong u)
 
 static int dm_open(struct inode *inode, struct file *filp)
 {
-	int r;
 	struct dm_file *priv;
 
-	r = nonseekable_open(inode, filp);
-	if (unlikely(r))
-		return r;
+	nonseekable_open(inode, filp);
 
 	priv = filp->private_data = kmalloc_obj(struct dm_file);
 	if (!priv)
@@ -2473,7 +2466,7 @@ int __init dm_early_create(struct dm_ioctl *dmi,
 	/* resume device */
 	r = dm_resume(md);
 	if (r)
-		goto err_destroy_table;
+		goto err_hash_remove;
 
 	DMINFO("%s (%s) is ready", md->disk->disk_name, dmi->name);
 	dm_put(md);
