@@ -603,6 +603,16 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 		if ((rold->id & BPF_ADD_CONST) && rold->delta != rcur->delta)
 			return false;
 
+		/*
+		 * BPF_SUBREG_EQ (low-32-only link) must match exactly: a later
+		 * low-32 narrowing propagates only for a subreg-linked register,
+		 * so pruning a plain register against a subreg-linked one (or vice
+		 * versa) is unsafe.
+		 */
+		if (rold->id &&
+		    (rold->id & BPF_SUBREG_EQ) != (rcur->id & BPF_SUBREG_EQ))
+			return false;
+
 		if (!check_scalar_ids(rold->id, rcur->id, idmap))
 			return false;
 
