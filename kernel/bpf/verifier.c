@@ -14932,6 +14932,28 @@ static int compute_scc_headers(struct bpf_verifier_env *env)
 	return 0;
 }
 
+/*
+ * Is @regno live across the back-edge of the loop containing the current insn?
+ * A register that is live before the loop header (env->scc_header) is read again
+ * in a later iteration, i.e. carried across the loop. Forming an in-loop subreg
+ * link on such a register mints a fresh scalar id every iteration, so state
+ * pruning never converges; callers skip the link for it. A register that is not
+ * carried (a fresh in-loop temporary, e.g. a loaded array index) is dead across
+ * the back-edge, so its link is safe and worth keeping.
+ */
+static bool reg_is_loop_carried(struct bpf_verifier_env *env, u32 regno)
+{
+	u32 scc = env->insn_aux_data[env->insn_idx].scc;
+	u32 header;
+
+	if (!scc || !env->scc_header)		/* not in a loop */
+		return false;
+	header = env->scc_header[scc];
+	if (header == U32_MAX)
+		return false;
+	return env->insn_aux_data[header].live_regs_before & BIT(regno);
+}
+
 /* check validity of 32-bit and 64-bit arithmetic operations */
 static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
@@ -15036,16 +15058,41 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 				} else if (src_reg->type == SCALAR_VALUE) {
 					if (insn->off == 0) {
 						bool is_src_reg_u32 = get_reg_width(src_reg) <= 32;
+						bool dst_carried = reg_is_loop_carried(env, insn->dst_reg);
+						/*
+						 * A full-id link is only sound when the source fits in
+						 * u32: dst is zero-extended to 32 bits, so its range must
+						 * not be propagated back onto the source's high bits. For
+						 * a wide source form a low-32-only BPF_SUBREG_EQ link
+						 * instead, so a later narrowing of the source's low 32
+						 * bits still reaches dst. Skip only when dst is carried
+						 * across a loop back-edge: forming the link there mints a
+						 * fresh id each iteration and stops state pruning from
+						 * converging. A fresh in-loop temp still gets the link.
+						 */
+						bool subreg_link = !is_src_reg_u32 && !dst_carried;
 
-						if (is_src_reg_u32)
+						if (is_src_reg_u32 || subreg_link)
 							assign_scalar_id_before_mov(env, src_reg);
 						*dst_reg = *src_reg;
-						/* Make sure ID is cleared if src_reg is not in u32
-						 * range otherwise dst_reg min/max could be incorrectly
-						 * propagated into src_reg by sync_linked_regs()
-						 */
-						if (!is_src_reg_u32)
-							clear_scalar_id(dst_reg);
+						if (!is_src_reg_u32) {
+							if (subreg_link && reg_id_scalar_id(src_reg->id)) {
+								dst_reg->id = src_reg->id | BPF_SUBREG_EQ;
+								/*
+								 * Zero-extension: high bits are 0, not a
+								 * sign-extension of the low field. Clear any
+								 * sext_width copied from a sext-linked src so
+								 * sync_linked_regs() rebuilds dst with
+								 * reconstruct_zext32(), not reconstruct_sext32().
+								 */
+								dst_reg->sext_width = 0;
+							} else {
+								/* full-id link would let sync_linked_regs()
+								 * propagate dst's min/max back into src
+								 */
+								clear_scalar_id(dst_reg);
+							}
+						}
 						dst_reg->subreg_def = env->insn_idx + 1;
 					} else {
 						/* case: W1 = (s8, s16)W2 */
@@ -15898,6 +15945,29 @@ static void collect_linked_regs(struct bpf_verifier_env *env,
 	}
 }
 
+/*
+ * Set @reg to the zero-extension of the low 32 bits currently held by @src.
+ * A BPF_SUBREG_EQ-linked register came from a 32-bit zero-extending mov
+ * (w0 = w1): it shares @src's low 32 bits and its high bits are zero. Callers
+ * must ensure no ADD_CONST delta is involved (see sync_linked_regs()), so
+ * @src's low 32 bits equal the base's low 32 bits.
+ */
+static void reconstruct_zext32(struct bpf_reg_state *reg, struct bpf_reg_state *src)
+{
+	u32 u32min = reg_u32_min(src);
+	u32 u32max = reg_u32_max(src);
+
+	if (u32min == u32max) {
+		/* Low 32 bits are constant -> the whole zero-extended value is known. */
+		___mark_reg_known(reg, (u64)u32min);
+	} else {
+		reg->r32 = cnum32_from_urange(u32min, u32max);
+		reg_set_urange64(reg, (u64)u32min, (u64)u32max);
+		reg->var_off = tnum_range((u64)u32min, (u64)u32max);
+		reg_bounds_sync(reg);
+	}
+}
+
 /* For all R in linked_regs, copy known_reg range into R
  * if R->id == known_reg->id.
  */
@@ -15916,6 +15986,35 @@ static void sync_linked_regs(struct bpf_verifier_env *env, struct bpf_verifier_s
 		if (reg->type != SCALAR_VALUE || reg == known_reg)
 			continue;
 		if (reg_id_scalar_id(reg->id) != reg_id_scalar_id(known_reg->id))
+			continue;
+		/*
+		 * A BPF_SUBREG_EQ linked register shares only the base's low 32
+		 * bits; its high bits are zero (from a 32-bit zero-extending mov).
+		 * Rebuild it from known_reg's low 32 bits, but only when neither
+		 * side carries an ADD_CONST delta -- with a delta the low bits
+		 * differ from the base by that delta and the combined
+		 * subreg+ADD_CONST reconstruction isn't modeled here, so leave reg
+		 * unchanged (sound, just less precise).
+		 */
+		if (reg->id & BPF_SUBREG_EQ) {
+			if (!((reg->id | known_reg->id) & BPF_ADD_CONST)) {
+				s32 saved_subreg_def = reg->subreg_def;
+
+				reconstruct_zext32(reg, known_reg);
+				reg->subreg_def = saved_subreg_def;
+				if (e->is_reg)
+					mark_reg_scratched(env, e->regno);
+				else
+					mark_stack_slot_scratched(env, e->spi);
+			}
+			continue;
+		}
+		/*
+		 * Dest-driven direction (known_reg is subreg-linked, reg is not):
+		 * copying known_reg's low-32-only state into a full register would
+		 * be unsound, so leave reg unchanged.
+		 */
+		if (known_reg->id & BPF_SUBREG_EQ)
 			continue;
 		/*
 		 * Skip mixed 32/64-bit links: the delta relationship doesn't
