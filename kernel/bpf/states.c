@@ -541,6 +541,24 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 
 	switch (base_type(rold->type)) {
 	case SCALAR_VALUE:
+		/*
+		 * Sign-extension tracking changes how a register is narrowed and
+		 * reconstructed later:
+		 *  - BPF_SUBREG_EQ marks a low-32-bit-only link (vs full/ADD_CONST
+		 *    equality) with different sync_linked_regs() semantics;
+		 *  - sext_width marks that the high bits are the sign-extension of
+		 *    the low field, driving reconstruction on a later narrowing.
+		 * Neither is captured by the range/tnum comparison or the id map
+		 * (check_scalar_ids() ignores BPF_SUBREG_EQ; sext_width lives past
+		 * ->id and is excluded from the explore_alu_limits memcmp below),
+		 * so a mismatch is not safe to prune across. Check both here first.
+		 */
+		if (rold->id &&
+		    (rold->id & BPF_SUBREG_EQ) != (rcur->id & BPF_SUBREG_EQ))
+			return false;
+		if (rold->sext_width != rcur->sext_width)
+			return false;
+
 		if (env->explore_alu_limits) {
 			/* explore_alu_limits disables tnum_in() and range_within()
 			 * logic and requires everything to be strict
@@ -601,16 +619,6 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 
 		/* Both have offset linkage: offsets must match */
 		if ((rold->id & BPF_ADD_CONST) && rold->delta != rcur->delta)
-			return false;
-
-		/*
-		 * BPF_SUBREG_EQ (low-32-only link) must match exactly: a later
-		 * low-32 narrowing propagates only for a subreg-linked register,
-		 * so pruning a plain register against a subreg-linked one (or vice
-		 * versa) is unsafe.
-		 */
-		if (rold->id &&
-		    (rold->id & BPF_SUBREG_EQ) != (rcur->id & BPF_SUBREG_EQ))
 			return false;
 
 		if (!check_scalar_ids(rold->id, rcur->id, idmap))
