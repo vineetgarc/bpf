@@ -15135,6 +15135,14 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 						if (!is_src_reg_u32) {
 							if (subreg_link && reg_id_scalar_id(src_reg->id)) {
 								dst_reg->id = src_reg->id | BPF_SUBREG_EQ;
+								/*
+								 * Zero-extension: high bits are 0, not a
+								 * sign-extension of the low field. Clear any
+								 * sext_width copied from a sext-linked src so
+								 * sync_linked_regs() rebuilds dst with
+								 * reconstruct_zext32(), not reconstruct_sext32().
+								 */
+								dst_reg->sext_width = 0;
 							} else {
 								/* full-id link would let sync_linked_regs()
 								 * propagate dst's min/max back into src
