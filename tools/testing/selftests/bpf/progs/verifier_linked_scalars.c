@@ -971,4 +971,47 @@ l_out_%=:							\
 	: __clobber_all);
 }
 
+/*
+ * A separate-destination 32-bit sign extension INSIDE a loop keeps its low-32
+ * link, so a later bounds check on the source narrows the sign-extended
+ * destination too. This is the bytecode a bpf-gcc build emits for array indexing
+ * in a bpf_for loop -- a fresh 32-bit index load, a separate "r1 = (s32)r0",
+ * then a bounds check on the index (verifier_global_subprogs' syscall_array_bpf_for).
+ *
+ * The in-loop link is gated on destination liveness: r1 here is a fresh temp,
+ * dead across the back-edge, so the link is formed and "if w0 > 99" narrows r1
+ * to [0, 99]; the guarded div-by-zero is then unreachable. Contrast
+ * sext_in_loop_converges, where the sext target is the loop-carried counter and
+ * the link is skipped to keep pruning convergent.
+ *
+ * Written in asm so the bytecode is identical regardless of the host BPF
+ * compiler.
+ */
+SEC("socket")
+__success
+__naked void sext_in_loop_separate_dest_index(void)
+{
+	asm volatile ("						\
+l_body_%=:							\
+	.byte 0xe5; /* may_goto l_exit (loop bound) */	\
+	.byte 0;						\
+	.short 7;						\
+	.long 0;						\
+	call %[bpf_get_prandom_u32];/* r0 = fresh u32 each iter */ \
+	r1 = (s32)r0;		/* in-loop separate-dest sext */ \
+	if w0 > 0x63 goto l_body_%=;/* fall-through: w0 <= 99 */	\
+	/* want r1 = sext32(r0 low) == [0, 99] here (needs the link) */ \
+	if r1 > 0x63 goto l_err_%=;/* taken unless r1 narrowed */ \
+	goto l_body_%=;						\
+l_err_%=:							\
+	r0 /= 0;		/* reachable iff r1 not narrowed */	\
+	goto l_body_%=;						\
+l_exit_%=:							\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";
