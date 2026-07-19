@@ -15064,16 +15064,34 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 				} else if (src_reg->type == SCALAR_VALUE) {
 					if (insn->off == 0) {
 						bool is_src_reg_u32 = get_reg_width(src_reg) <= 32;
+						bool in_loop = env->insn_aux_data[env->insn_idx].scc != 0;
+						/*
+						 * A full-id link is only sound when the source fits in
+						 * u32: dst is zero-extended to 32 bits, so its range must
+						 * not be propagated back onto the source's high bits. For
+						 * a wide source form a low-32-only BPF_SUBREG_EQ link
+						 * instead (sext_width 0 -> zero-extension reconstruction),
+						 * so a later narrowing of the source's low 32 bits still
+						 * reaches dst. Skip inside a loop (coarse; refined to a
+						 * liveness test in a later patch): forming the link there
+						 * mints a fresh id each iteration and stops state pruning
+						 * from converging.
+						 */
+						bool subreg_link = !is_src_reg_u32 && !in_loop;
 
-						if (is_src_reg_u32)
+						if (is_src_reg_u32 || subreg_link)
 							assign_scalar_id_before_mov(env, src_reg);
 						*dst_reg = *src_reg;
-						/* Make sure ID is cleared if src_reg is not in u32
-						 * range otherwise dst_reg min/max could be incorrectly
-						 * propagated into src_reg by sync_linked_regs()
-						 */
-						if (!is_src_reg_u32)
-							clear_scalar_id(dst_reg);
+						if (!is_src_reg_u32) {
+							if (subreg_link && reg_id_scalar_id(src_reg->id)) {
+								dst_reg->id = src_reg->id | BPF_SUBREG_EQ;
+							} else {
+								/* full-id link would let sync_linked_regs()
+								 * propagate dst's min/max back into src
+								 */
+								clear_scalar_id(dst_reg);
+							}
+						}
 						dst_reg->subreg_def = env->insn_idx + 1;
 					} else {
 						/* case: W1 = (s8, s16)W2 */
@@ -15927,6 +15945,29 @@ static void collect_linked_regs(struct bpf_verifier_env *env,
 }
 
 /*
+ * Set @reg to the zero-extension of the low 32 bits currently held by @src.
+ * A BPF_SUBREG_EQ-linked register with sext_width 0 came from a 32-bit
+ * zero-extending mov (w0 = w1): it shares @src's low 32 bits and its high bits
+ * are zero. Callers must ensure no ADD_CONST delta is involved (see
+ * sync_linked_regs()), so @src's low 32 bits equal the base's low 32 bits.
+ */
+static void reconstruct_zext32(struct bpf_reg_state *reg, struct bpf_reg_state *src)
+{
+	u32 u32min = reg_u32_min(src);
+	u32 u32max = reg_u32_max(src);
+
+	if (u32min == u32max) {
+		/* Low 32 bits are constant -> the whole zero-extended value is known. */
+		___mark_reg_known(reg, (u64)u32min);
+	} else {
+		reg->r32 = cnum32_from_urange(u32min, u32max);
+		reg_set_urange64(reg, (u64)u32min, (u64)u32max);
+		reg->var_off = tnum_range((u64)u32min, (u64)u32max);
+		reg_bounds_sync(reg);
+	}
+}
+
+/*
  * Set @reg to the sign-extension of the low 32 bits currently held by
  * @src (a BPF_SUBREG_EQ-linked register shares only @src's low 32 bits, and its
  * high bits are the sign-extension of that low field). Only the value fields are
@@ -15970,20 +16011,29 @@ static void sync_linked_regs(struct bpf_verifier_env *env, struct bpf_verifier_s
 		if (reg_id_scalar_id(reg->id) != reg_id_scalar_id(known_reg->id))
 			continue;
 		/*
-		 * A BPF_SUBREG_EQ linked register shares only the base's
-		 * low 32 bits; its high bits are the sign-extension of that low
-		 * field. Rebuild it from known_reg's low 32 bits instead of
-		 * copying the full 64-bit state.
+		 * A BPF_SUBREG_EQ linked register shares only the base's low 32
+		 * bits; its high bits are either zero (32-bit zero-extending mov,
+		 * sext_width 0) or the sign-extension of the low field (32-bit sign
+		 * extension, sext_width != 0). Rebuild it from known_reg's low 32
+		 * bits accordingly, instead of copying the full 64-bit state -- but
+		 * only when neither side carries an ADD_CONST delta, since the
+		 * combined subreg+delta reconstruction is not modeled (leave reg
+		 * unchanged: sound, just less precise).
 		 */
 		if (reg->id & BPF_SUBREG_EQ) {
-			s32 saved_subreg_def = reg->subreg_def;
+			if (!((reg->id | known_reg->id) & BPF_ADD_CONST)) {
+				s32 saved_subreg_def = reg->subreg_def;
 
-			reconstruct_sext32(reg, known_reg);
-			reg->subreg_def = saved_subreg_def;
-			if (e->is_reg)
-				mark_reg_scratched(env, e->regno);
-			else
-				mark_stack_slot_scratched(env, e->spi);
+				if (reg->sext_width)
+					reconstruct_sext32(reg, known_reg);
+				else
+					reconstruct_zext32(reg, known_reg);
+				reg->subreg_def = saved_subreg_def;
+				if (e->is_reg)
+					mark_reg_scratched(env, e->regno);
+				else
+					mark_stack_slot_scratched(env, e->spi);
+			}
 			continue;
 		}
 		/*
