@@ -14939,6 +14939,28 @@ static int compute_scc_headers(struct bpf_verifier_env *env)
 	return 0;
 }
 
+/*
+ * Is @regno live across the back-edge of the loop containing the current insn?
+ * A register that is live before the loop header (env->scc_header) is read again
+ * in a later iteration, i.e. carried across the loop. Forming an in-loop subreg
+ * link on such a register mints a fresh scalar id every iteration, so state
+ * pruning never converges; callers skip the link for it. A register that is not
+ * carried (a fresh in-loop temporary, e.g. a loaded array index) is dead across
+ * the back-edge, so its link is safe and worth keeping.
+ */
+static bool reg_is_loop_carried(struct bpf_verifier_env *env, u32 regno)
+{
+	u32 scc = env->insn_aux_data[env->insn_idx].scc;
+	u32 header;
+
+	if (!scc || !env->scc_header)		/* not in a loop */
+		return false;
+	header = env->scc_header[scc];
+	if (header == U32_MAX)
+		return false;
+	return env->insn_aux_data[header].live_regs_before & BIT(regno);
+}
+
 static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
 	struct bpf_reg_state *regs = cur_regs(env);
@@ -15020,17 +15042,17 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 					} else if (src_reg->type == SCALAR_VALUE) {
 						int sz = insn->off >> 3;
 						bool no_sext;
-						bool in_loop;
 						bool subreg_link;
+						bool dst_carried;
 
 						no_sext = reg_umax(src_reg) < (1ULL << (insn->off - 1));
 						/*
-						 * scc != 0 means this insn is in a non-singleton
-						 * strongly-connected component, i.e. a loop body.
+						 * dst is carried across a loop back-edge if it is live
+						 * before the loop header (read in a later iteration).
 						 */
-						in_loop = env->insn_aux_data[env->insn_idx].scc != 0;
+						dst_carried = reg_is_loop_carried(env, insn->dst_reg);
 
-						subreg_link = (sz == 4) && !in_loop;
+						subreg_link = (sz == 4) && !dst_carried;
 
 						/*
 						 * When no_sext, dst == src exactly, so link them (existing
@@ -15040,12 +15062,13 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 						 * a later narrowing of the low 32 bits propagates here, and
 						 * reg_bounds_sync()/sync_linked_regs() rebuild the high half.
 						 *
-						 * Skip the link inside a loop: forming it there mints
-						 * a fresh scalar id every iteration, and the live link
-						 * doubles the loop's branch-state space, preventing state
-						 * pruning from converging (bpf-gcc sign-extends inside
-						 * loops; LLVM does not). Only in-loop sext precision is
-						 * lost -- soundness is unaffected.
+						 * Skip the link only when dst is carried across a loop
+						 * back-edge: re-marking a loop-carried register with a
+						 * fresh id + sext_width every iteration prevents state
+						 * pruning from converging (the cond_break counter pattern).
+						 * A fresh in-loop sext (e.g. a loaded array index, dead
+						 * across the back-edge) still gets the link, so a later
+						 * narrowing reaches it.
 						 */
 						if (no_sext || subreg_link)
 							assign_scalar_id_before_mov(env, src_reg);
@@ -15091,7 +15114,7 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 				} else if (src_reg->type == SCALAR_VALUE) {
 					if (insn->off == 0) {
 						bool is_src_reg_u32 = get_reg_width(src_reg) <= 32;
-						bool in_loop = env->insn_aux_data[env->insn_idx].scc != 0;
+						bool dst_carried = reg_is_loop_carried(env, insn->dst_reg);
 						/*
 						 * A full-id link is only sound when the source fits in
 						 * u32: dst is zero-extended to 32 bits, so its range must
@@ -15099,12 +15122,12 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 						 * a wide source form a low-32-only BPF_SUBREG_EQ link
 						 * instead (sext_width 0 -> zero-extension reconstruction),
 						 * so a later narrowing of the source's low 32 bits still
-						 * reaches dst. Skip inside a loop (coarse; refined to a
-						 * liveness test in a later patch): forming the link there
-						 * mints a fresh id each iteration and stops state pruning
-						 * from converging.
+						 * reaches dst. Skip only when dst is carried across a loop
+						 * back-edge: forming the link there mints a fresh id each
+						 * iteration and stops state pruning from converging. A
+						 * fresh in-loop temp still gets the link.
 						 */
-						bool subreg_link = !is_src_reg_u32 && !in_loop;
+						bool subreg_link = !is_src_reg_u32 && !dst_carried;
 
 						if (is_src_reg_u32 || subreg_link)
 							assign_scalar_id_before_mov(env, src_reg);
