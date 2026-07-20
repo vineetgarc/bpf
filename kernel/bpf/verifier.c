@@ -15075,7 +15075,7 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 						*dst_reg = *src_reg;
 						if (!no_sext) {
 							if (subreg_link &&
-							    (src_reg->id & ~BPF_SUBREG_EQ)) {
+							    reg_id_scalar_id(src_reg->id)) {
 								dst_reg->id = src_reg->id | BPF_SUBREG_EQ;
 								dst_reg->sext_width = 4;
 							} else {
