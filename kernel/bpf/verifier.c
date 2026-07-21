@@ -1823,6 +1823,8 @@ static void __mark_reg_known(struct bpf_reg_state *reg, u64 imm)
 	       offsetof(struct bpf_reg_state, var_off) - sizeof(reg->type));
 	reg->id = 0;
 	reg->parent_id = 0;
+	/* A known constant has no sign-extension self-relationship. */
+	reg->sext_width = 0;
 	___mark_reg_known(reg, imm);
 }
 
@@ -3358,6 +3360,8 @@ static void clear_scalar_id(struct bpf_reg_state *reg)
 {
 	reg->id = 0;
 	reg->delta = 0;
+	/* id = 0 also clears BPF_SUBREG_EQ; drop any sext-self relationship. */
+	reg->sext_width = 0;
 }
 
 static void assign_scalar_id_before_mov(struct bpf_verifier_env *env,
@@ -14955,6 +14959,8 @@ static bool reg_is_loop_carried(struct bpf_verifier_env *env, u32 regno)
 }
 
 /* check validity of 32-bit and 64-bit arithmetic operations */
+static void reconstruct_sext32(struct bpf_reg_state *reg, struct bpf_reg_state *src);
+
 static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
 	struct bpf_reg_state *regs = cur_regs(env);
@@ -15034,15 +15040,67 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 							insn->src_reg);
 						return -EACCES;
 					} else if (src_reg->type == SCALAR_VALUE) {
+						int sz = insn->off >> 3;
 						bool no_sext;
+						bool dst_carried;
+						bool subreg_link;
 
 						no_sext = reg_umax(src_reg) < (1ULL << (insn->off - 1));
-						if (no_sext)
+						/*
+						 * dst is carried across a loop back-edge if it is live
+						 * before the loop header (read in a later iteration).
+						 */
+						dst_carried = reg_is_loop_carried(env, insn->dst_reg);
+
+						/*
+						 * When no_sext, dst == src exactly, so link them
+						 * (existing behavior). When !no_sext for a 32-bit sign
+						 * extension the low 32 bits are still identical (sext
+						 * preserves them), so keep a BPF_SUBREG_EQ link plus a
+						 * sext-self marker (->sext_width): a later narrowing of
+						 * the low 32 bits propagates here, and sync_linked_regs()
+						 * rebuilds the high half via reconstruct_sext32().
+						 *
+						 * Skip the link only when dst is carried across a loop
+						 * back-edge: re-marking a loop-carried register with a
+						 * fresh linked id + sext_width every iteration stops state
+						 * pruning from converging (the cond_break counter pattern
+						 * bpf-gcc emits). A fresh in-loop sext -- e.g. a loaded
+						 * array index that is bounds-checked and used within the
+						 * iteration -- is dead across the back-edge, so it still
+						 * gets the link and the narrowing reaches it.
+						 */
+						subreg_link = (sz == 4) && !dst_carried;
+
+						if (no_sext || subreg_link)
 							assign_scalar_id_before_mov(env, src_reg);
 						*dst_reg = *src_reg;
-						if (!no_sext)
-							clear_scalar_id(dst_reg);
-						coerce_reg_to_size_sx(dst_reg, insn->off >> 3);
+						if (!no_sext) {
+							if (subreg_link &&
+							    reg_id_scalar_id(src_reg->id)) {
+								dst_reg->id = src_reg->id | BPF_SUBREG_EQ;
+								dst_reg->sext_width = 4;
+							} else {
+								clear_scalar_id(dst_reg);
+							}
+						}
+						/*
+						 * Snapshot the low 32 bits before coerce clobbers them.
+						 * coerce_reg_to_size_sx() falls back to the full sext
+						 * range when smin/smax straddle the sign boundary (e.g.
+						 * an errno-or-zero value clamped to [-4095, 0]). For a
+						 * sext-self tracked register the high half IS the
+						 * sign-extension of the low 32 bits, so rebuild the tight
+						 * 64-bit range from those low bounds.
+						 */
+						if (dst_reg->sext_width == 4) {
+							struct bpf_reg_state sext_src = *dst_reg;
+
+							coerce_reg_to_size_sx(dst_reg, sz);
+							reconstruct_sext32(dst_reg, &sext_src);
+						} else {
+							coerce_reg_to_size_sx(dst_reg, sz);
+						}
 						dst_reg->subreg_def = DEF_NOT_SUBREG;
 					} else {
 						mark_reg_unknown(env, regs, insn->dst_reg);
@@ -15078,6 +15136,14 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 						if (!is_src_reg_u32) {
 							if (subreg_link && reg_id_scalar_id(src_reg->id)) {
 								dst_reg->id = src_reg->id | BPF_SUBREG_EQ;
+								/*
+								 * Zero-extension: high bits are 0, not a
+								 * sign-extension of the low field. Clear any
+								 * sext_width copied from a sext-linked src so
+								 * sync_linked_regs() rebuilds dst with
+								 * reconstruct_zext32(), not reconstruct_sext32().
+								 */
+								dst_reg->sext_width = 0;
 							} else {
 								/* full-id link would let sync_linked_regs()
 								 * propagate dst's min/max back into src
@@ -15960,6 +16026,32 @@ static void reconstruct_zext32(struct bpf_reg_state *reg, struct bpf_reg_state *
 	}
 }
 
+/*
+ * Set @reg to the sign-extension of the low 32 bits currently held by @src.
+ * A BPF_SUBREG_EQ-linked register with ->sext_width came from a 32-bit sign
+ * extension (r0 = (s32)r0): it shares @src's low 32 bits and its high bits are
+ * the sign-extension of that low field. Only the value fields are written;
+ * @reg's linkage fields (id, delta, subreg_def, sext_width) are left intact by
+ * the caller (___mark_reg_known touches only var_off/r64/r32). Callers must
+ * ensure no ADD_CONST delta is involved (see sync_linked_regs()).
+ */
+static void reconstruct_sext32(struct bpf_reg_state *reg, struct bpf_reg_state *src)
+{
+	s32 s32min = reg_s32_min(src);
+	s32 s32max = reg_s32_max(src);
+
+	if (s32min == s32max) {
+		/* Low 32 bits are constant -> the whole value is the sext constant. */
+		___mark_reg_known(reg, (u64)(s64)s32min);
+	} else {
+		/* Sign-extension is monotonic over the signed-32 range. */
+		reg_set_srange64(reg, (s64)s32min, (s64)s32max);
+		reg_set_srange32(reg, s32min, s32max);
+		reg->var_off = tnum_range((u64)(s64)s32min, (u64)(s64)s32max);
+		reg_bounds_sync(reg);
+	}
+}
+
 /* For all R in linked_regs, copy known_reg range into R
  * if R->id == known_reg->id.
  */
@@ -15981,10 +16073,12 @@ static void sync_linked_regs(struct bpf_verifier_env *env, struct bpf_verifier_s
 			continue;
 		/*
 		 * A BPF_SUBREG_EQ linked register shares only the base's low 32
-		 * bits; its high bits are zero (from a 32-bit zero-extending mov).
-		 * Rebuild it from known_reg's low 32 bits, but only when neither
-		 * side carries an ADD_CONST delta -- with a delta the low bits
-		 * differ from the base by that delta and the combined
+		 * bits; its high bits are either zero (32-bit zero-extending mov)
+		 * or the sign-extension of the low field (32-bit sign extension,
+		 * flagged by ->sext_width).
+		 * Rebuild it from known_reg's low 32 bits accordingly, but only
+		 * when neither side carries an ADD_CONST delta -- with a delta
+		 * the low bits differ from the base by that delta and the combined
 		 * subreg+ADD_CONST reconstruction isn't modeled here, so leave reg
 		 * unchanged (sound, just less precise).
 		 */
@@ -15992,7 +16086,10 @@ static void sync_linked_regs(struct bpf_verifier_env *env, struct bpf_verifier_s
 			if (!((reg->id | known_reg->id) & BPF_ADD_CONST)) {
 				s32 saved_subreg_def = reg->subreg_def;
 
-				reconstruct_zext32(reg, known_reg);
+				if (reg->sext_width)
+					reconstruct_sext32(reg, known_reg);
+				else
+					reconstruct_zext32(reg, known_reg);
 				reg->subreg_def = saved_subreg_def;
 				if (e->is_reg)
 					mark_reg_scratched(env, e->regno);
