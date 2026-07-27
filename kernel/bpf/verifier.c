@@ -14938,6 +14938,8 @@ clear_id:
 	return 0;
 }
 
+static void reconstruct_sext32(struct bpf_reg_state *reg, struct bpf_reg_state *src);
+
 /* check validity of 32-bit and 64-bit arithmetic operations */
 static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
@@ -15014,15 +15016,51 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 							insn->src_reg);
 						return -EACCES;
 					} else if (src_reg->type == SCALAR_VALUE) {
+						int sz = insn->off >> 3;
 						bool no_sext;
+						bool subreg_link;
 
 						no_sext = reg_umax(src_reg) < (1ULL << (insn->off - 1));
-						if (no_sext)
+						/*
+						 * When no_sext, dst == src exactly, so link them
+						 * (existing behavior). When !no_sext for a 32-bit sign
+						 * extension the low 32 bits are still identical (sext
+						 * preserves them), so form a BPF_FLAG_SUBREG_SEXT
+						 * link: a later narrowing of the low 32 bits
+						 * propagates here, and sync_linked_regs() rebuilds
+						 * the high half via reconstruct_sext32().
+						 */
+						subreg_link = (sz == 4);
+
+						if (no_sext || subreg_link)
 							assign_scalar_id_before_mov(env, src_reg);
 						*dst_reg = *src_reg;
-						if (!no_sext)
-							clear_scalar_id(dst_reg);
-						coerce_reg_to_size_sx(dst_reg, insn->off >> 3);
+						if (!no_sext) {
+							if (subreg_link && src_reg->id) {
+								/* ->id already copied above */
+								dst_reg->flags = (dst_reg->flags & ~BPF_FLAG_SUBREG) |
+										 BPF_FLAG_SUBREG_SEXT;
+							} else {
+								clear_scalar_id(dst_reg);
+							}
+						}
+						/*
+						 * Snapshot the low 32 bits before coerce clobbers them.
+						 * coerce_reg_to_size_sx() falls back to the full sext
+						 * range when smin/smax straddle the sign boundary (e.g.
+						 * an errno-or-zero value clamped to [-4095, 0]). For a
+						 * sext-self tracked register the high half IS the
+						 * sign-extension of the low 32 bits, so rebuild the tight
+						 * 64-bit range from those low bounds.
+						 */
+						if (dst_reg->flags & BPF_FLAG_SUBREG_SEXT) {
+							struct bpf_reg_state sext_src = *dst_reg;
+
+							coerce_reg_to_size_sx(dst_reg, sz);
+							reconstruct_sext32(dst_reg, &sext_src);
+						} else {
+							coerce_reg_to_size_sx(dst_reg, sz);
+						}
 					} else {
 						mark_reg_unknown(env, regs, insn->dst_reg);
 					}
@@ -15069,7 +15107,15 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 						if (!is_src_reg_u32) {
 							if (wide_subreg_link && src_reg->id) {
 								/* ->id already copied above */
-								dst_reg->flags |= BPF_FLAG_SUBREG_ZEXT;
+								/*
+								 * Zero-extension: high bits are 0, not a
+								 * sign-extension of the low field. Drop any
+								 * SUBREG_SEXT copied from a sext-linked src
+								 * so sync_linked_regs() rebuilds dst by
+								 * zero-extension, not reconstruct_sext32().
+								 */
+								dst_reg->flags = (dst_reg->flags & ~BPF_FLAG_SUBREG) |
+										 BPF_FLAG_SUBREG_ZEXT;
 							} else {
 								clear_scalar_id(dst_reg);
 							}
@@ -15923,6 +15969,32 @@ static void collect_linked_regs(struct bpf_verifier_env *env,
 	}
 }
 
+/*
+ * Set @reg to the sign-extension of the low 32 bits currently held by @src.
+ * A BPF_FLAG_SUBREG_SEXT-linked register came from a 32-bit sign
+ * extension (r0 = (s32)r0): it shares @src's low 32 bits and its high bits are
+ * the sign-extension of that low field. Only the value fields are written;
+ * @reg's linkage fields (id, delta, flags) are left intact by
+ * the caller (___mark_reg_known touches only var_off/r64/r32). Callers must
+ * ensure no ADD_CONST delta is involved (see sync_linked_regs()).
+ */
+static void reconstruct_sext32(struct bpf_reg_state *reg, struct bpf_reg_state *src)
+{
+	s32 s32min = reg_s32_min(src);
+	s32 s32max = reg_s32_max(src);
+
+	if (s32min == s32max) {
+		/* Low 32 bits are constant -> the whole value is the sext constant. */
+		___mark_reg_known(reg, (u64)(s64)s32min);
+	} else {
+		/* Sign-extension is monotonic over the signed-32 range. */
+		reg_set_srange64(reg, (s64)s32min, (s64)s32max);
+		reg_set_srange32(reg, s32min, s32max);
+		reg->var_off = tnum_range((u64)(s64)s32min, (u64)(s64)s32max);
+		reg_bounds_sync(reg);
+	}
+}
+
 /* For all R in linked_regs, copy known_reg range into R
  * if R->id == known_reg->id.
  */
@@ -15946,16 +16018,21 @@ static void sync_linked_regs(struct bpf_verifier_env *env, struct bpf_verifier_s
 		 * A low-32 linked register shares only the base's low 32 bits;
 		 * the flag says how its high bits are derived. For
 		 * BPF_FLAG_SUBREG_ZEXT they are zero (32-bit zero-extending mov).
+		 * For BPF_FLAG_SUBREG_SEXT they are the sign-extension of the low
+		 * field (32-bit sign extension).
 		 * Rebuild it from known_reg's low 32 bits accordingly, but only
 		 * when neither side carries an ADD_CONST delta -- with a delta
 		 * the low bits differ from the base by that delta and the combined
 		 * subreg+ADD_CONST reconstruction isn't modeled here, so leave reg
 		 * unchanged (sound, just less precise).
 		 */
-		if (reg->flags & BPF_FLAG_SUBREG_ZEXT) {
+		if (reg->flags & BPF_FLAG_SUBREG) {
 			if (!((reg->flags | known_reg->flags) & BPF_FLAG_ADD_CONST)) {
-				{
+				if (reg->flags & BPF_FLAG_SUBREG_SEXT) {
+					reconstruct_sext32(reg, known_reg);
+				} else {
 					u32 saved_id = reg->id;
+					u8 saved_subreg = reg->flags & BPF_FLAG_SUBREG;
 
 					/*
 					 * reg = zext32(known_reg): its low 32 bits come from
@@ -15969,6 +16046,7 @@ static void sync_linked_regs(struct bpf_verifier_env *env, struct bpf_verifier_s
 					 */
 					*reg = *known_reg;
 					reg->id = saved_id;
+					reg->flags = (reg->flags & ~BPF_FLAG_SUBREG) | saved_subreg;
 					zext_32_to_64(reg);
 					reg_bounds_sync(reg);
 				}
@@ -15984,7 +16062,7 @@ static void sync_linked_regs(struct bpf_verifier_env *env, struct bpf_verifier_s
 		 * copying known_reg's low-32-only state into a full register would
 		 * be unsound, so leave reg unchanged.
 		 */
-		if (known_reg->flags & BPF_FLAG_SUBREG_ZEXT)
+		if (known_reg->flags & BPF_FLAG_SUBREG)
 			continue;
 		/*
 		 * Skip mixed 32/64-bit links: the delta relationship doesn't
