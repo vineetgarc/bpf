@@ -710,4 +710,34 @@ l_exit_%=:							\
 	: __clobber_all);
 }
 
+/*
+ * A 32-bit zero-extending mov (w7 = w6) from a source with unknown high bits
+ * shares only the low 32 bits (w7.lo == w6.lo, w7.hi == 0). A later narrowing of
+ * the source's low 32 bits must propagate to the destination via the
+ * BPF_SUBREG_EQ (low-32-only) link. This is the pattern bpf-gcc emits when it
+ * reuses "w0 = idx" for "return 0" on the idx==0 path of a callback.
+ */
+SEC("socket")
+__success
+__naked void subreg_eq_zext_mov_narrow(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r6 = r0;		/* r6 low = unknown u32 (callee-saved) */ \
+	call %[bpf_get_prandom_u32];				\
+	r0 <<= 32;		/* r0 = unknown high bits */	\
+	r6 |= r0;		/* r6 = full 64-bit unknown (width 64) */ \
+	w7 = w6;		/* 32-bit zero-extend mov, wide src */	\
+	if w6 != 0 goto l_out_%=;	/* w6 low == 0 on fall-through */ \
+	/* w7 = zext32(w6 low) must be 0 here */		\
+	if w7 == 0 goto l_out_%=;	/* provably 0 iff linked */	\
+	r0 /= 0;		/* reached only if w7 not deduced 0 */	\
+l_out_%=:							\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all, "r6", "r7");
+}
+
 char _license[] SEC("license") = "GPL";
