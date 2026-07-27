@@ -899,6 +899,7 @@ enum ARG_KEYS {
 	ARG_JSON_SUMMARY = 'J',
 	ARG_TRAFFIC_MONITOR = 'm',
 	ARG_WATCHDOG_TIMEOUT = 'w',
+	ARG_NO_ERROR_SUMMARY = 'e',
 };
 
 static const struct argp_option opts[] = {
@@ -931,6 +932,8 @@ static const struct argp_option opts[] = {
 #endif
 	{ "watchdog-timeout", ARG_WATCHDOG_TIMEOUT, "SECONDS", 0,
 	  "Kill the process if tests are not making progress for specified number of seconds." },
+	{ "no-error-summary", ARG_NO_ERROR_SUMMARY, NULL, 0,
+	  "Do not re-print the aggregated error logs of failed tests at the end of the run." },
 	{},
 };
 
@@ -1131,6 +1134,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case ARG_DEBUG:
 		env->debug = true;
+		break;
+	case ARG_NO_ERROR_SUMMARY:
+		env->error_summary = false;
 		break;
 	case ARG_JSON_SUMMARY:
 		env->json = fopen(arg, "w");
@@ -1687,7 +1693,7 @@ static void calculate_summary_and_print_errors(struct test_env *env)
 	 * verbose mode is not enabled. Otherwise, results may be inconsistent.
 	 *
 	 */
-	if (!verbose() && fail_cnt) {
+	if (env->error_summary && !verbose() && fail_cnt) {
 		printf("\nAll error logs:\n");
 
 		/* print error logs again */
@@ -2028,6 +2034,7 @@ int main(int argc, char **argv)
 
 	env.secs_till_notify = 10;
 	env.secs_till_kill = 120;
+	env.error_summary = true;
 	err = argp_parse(&argp, argc, argv, 0, NULL, &env);
 	if (err)
 		return err;
