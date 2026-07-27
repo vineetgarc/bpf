@@ -1020,4 +1020,42 @@ l_exit_%=:							\
 	: __clobber_all);
 }
 
+/*
+ * A 32-bit zero-extending mov (w2 = w1) whose SOURCE is a sign-extended register
+ * must still zero-extend: dst's high bits are 0, not the sign-extension of the
+ * low field. Regression test for the zext link clearing ->sext_width (otherwise
+ * dst would inherit sext_width=4 from the sext'd source, and sync_linked_regs()
+ * would later rebuild it with reconstruct_sext32() -- computing a negative value
+ * for what is actually a large positive zero-extended one).
+ *
+ * r1 = (s32)r6 makes r1 a sext-linked wide source; w2 = w1 forms the zext link.
+ * After "if w6 s>= 0" falls through, r6's low 32 bits have bit 31 set, so the
+ * zero-extended r2 is in [0x80000000, 0xffffffff] -- strictly positive. If the
+ * link were mis-tagged as sign-extending, r2 would be reconstructed negative and
+ * the guarded div-by-zero would be reachable.
+ */
+SEC("socket")
+__success
+__naked void zext_mov_from_sext_src_zero_extends(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r6 = r0;		/* r6 low = unknown u32 (callee-saved) */ \
+	call %[bpf_get_prandom_u32];				\
+	r0 <<= 32;						\
+	r6 |= r0;		/* r6 = full 64-bit unknown (width 64) */ \
+	r1 = (s32)r6;		/* r1 = sext32(r6 low): sext_width=4, wide */ \
+	w2 = w1;		/* zext mov from sext-linked wide src */ \
+	if w6 s>= 0 goto l_out_%=;/* fall-through: r6 low has bit 31 set */ \
+	/* r2 = zext32(r6 low) is in [0x80000000, 0xffffffff], i.e. >= 0 */ \
+	if r2 s>= 0 goto l_out_%=;/* always taken iff r2 zero-extended */ \
+	r0 /= 0;		/* reached iff r2 wrongly sign-extended */ \
+l_out_%=:							\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all, "r6");
+}
+
 char _license[] SEC("license") = "GPL";
