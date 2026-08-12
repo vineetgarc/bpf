@@ -162,9 +162,19 @@ struct bpf_reg_state {
 	 * pointing to bpf_func_state.
 	 */
 	u32 frameno;
-	/* if (!precise && SCALAR_VALUE) min/max/tnum don't affect safety */
-	bool precise;
+	/*
+	 * Register state flags.
+	 * BPF_FLAG_PRECISE: if unset, and this is a SCALAR_VALUE, then
+	 * min/max/tnum don't affect safety.
+	 */
+#define BPF_FLAG_PRECISE	(1U << 0)
+	u8 flags;
 };
+
+static inline bool reg_is_precise(const struct bpf_reg_state *reg)
+{
+	return reg->flags & BPF_FLAG_PRECISE;
+}
 
 static inline s64 reg_smin(const struct bpf_reg_state *reg)
 {
