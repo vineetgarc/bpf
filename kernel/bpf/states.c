@@ -370,12 +370,12 @@ static bool check_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap)
  * to cur_id=0 and pass. With temp IDs: r6 maps X->temp1, r7 tries to map
  * X->temp2, but X is already mapped to temp1, so the check fails correctly.
  *
- * When old_id has BPF_ADD_CONST set, the compound id (base | flag) and the
- * base id (flag stripped) must both map consistently. Example: old has
- * r2.id=A, r3.id=A|flag (r3 = r2 + delta), cur has r2.id=B, r3.id=C|flag
- * (r3 derived from unrelated r4). Without the base check, idmap gets two
- * independent entries A->B and A|flag->C|flag, missing that A->C conflicts
- * with A->B. The base ID cross-check catches this.
+ * ->id is a plain identifier -- the ADD_CONST relationship lives in
+ * ->flags -- so there is no compound (base | flag) key to unpack here.
+ * Registers sharing a base id go through one idmap entry, which is what
+ * catches e.g. old r2.id=A, r3.id=A (r3 = r2 + delta) against cur r2.id=B,
+ * r3.id=C: A->B and A->C conflict. Matching ->flags and ->delta are checked
+ * by the caller in regsafe().
  */
 static bool check_scalar_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap)
 {
@@ -384,15 +384,7 @@ static bool check_scalar_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap)
 
 	cur_id = cur_id ? cur_id : ++idmap->tmp_id_gen;
 
-	if (!check_ids(old_id, cur_id, idmap))
-		return false;
-	if (old_id & BPF_ADD_CONST) {
-		old_id &= ~BPF_ADD_CONST;
-		cur_id &= ~BPF_ADD_CONST;
-		if (!check_ids(old_id, cur_id, idmap))
-			return false;
-	}
-	return true;
+	return check_ids(old_id, cur_id, idmap);
 }
 
 static void __clean_func_state(struct bpf_verifier_env *env,
@@ -554,7 +546,7 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 		 * Linked register tracking uses rold->id to detect relationships.
 		 * When rold->id == 0, the register is independent and any linking
 		 * in rcur only adds constraints. When rold->id != 0, we must verify
-		 * id mapping and (for BPF_ADD_CONST) offset consistency.
+		 * id mapping and (for BPF_FLAG_ADD_CONST) offset consistency.
 		 *
 		 * +------------------+-----------+------------------+---------------+
 		 * |                  | rold->id  | rold + ADD_CONST | rold->id == 0 |
@@ -590,17 +582,17 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 		 */
 
 		/*
-		 * ADD_CONST flags must match exactly: BPF_ADD_CONST32 and
-		 * BPF_ADD_CONST64 have different linking semantics in
+		 * ADD_CONST flags must match exactly: BPF_FLAG_ADD_CONST32 and
+		 * BPF_FLAG_ADD_CONST64 have different linking semantics in
 		 * sync_linked_regs() (alu32 zero-extends, alu64 does not),
 		 * so pruning across different flag types is unsafe.
 		 */
 		if (rold->id &&
-		    (rold->id & BPF_ADD_CONST) != (rcur->id & BPF_ADD_CONST))
+		    (rold->flags & BPF_FLAG_ADD_CONST) != (rcur->flags & BPF_FLAG_ADD_CONST))
 			return false;
 
 		/* Both have offset linkage: offsets must match */
-		if ((rold->id & BPF_ADD_CONST) && rold->delta != rcur->delta)
+		if ((rold->flags & BPF_FLAG_ADD_CONST) && rold->delta != rcur->delta)
 			return false;
 
 		if (!check_scalar_ids(rold->id, rcur->id, idmap))
